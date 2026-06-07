@@ -1,5 +1,3 @@
-mod reranker;
-
 use axum::{
     extract::State,
     http::StatusCode,
@@ -13,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use reranker::RerankerModel;
+use reranker_api::RerankerModel;
 
 #[derive(Clone)]
 struct AppState {
