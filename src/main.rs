@@ -8,6 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -16,6 +17,7 @@ use reranker_api::RerankerModel;
 #[derive(Clone)]
 struct AppState {
     model: Arc<Mutex<RerankerModel>>,
+    semaphore: Arc<Semaphore>,
 }
 
 #[derive(OpenApi)]
@@ -132,14 +134,29 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse>
     responses(
         (status = 200, description = "Reranking completed successfully", body = RerankResponse),
         (status = 400, description = "Invalid request"),
-        (status = 500, description = "Inference error")
+        (status = 500, description = "Inference error"),
+        (status = 503, description = "Server at capacity")
     )
 )]
 async fn rerank(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RerankRequest>,
 ) -> impl IntoResponse {
+    let permit = match state.semaphore.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            let error = ErrorResponse {
+                error: ErrorDetail {
+                    message: "Server is at capacity. Try again later.".into(),
+                    error_type: "server_error".into(),
+                },
+            };
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
+        }
+    };
+
     let mut model = state.model.lock().unwrap();
+    let _ = permit; // hold until end of scope
 
     if req.model != model.name {
         let error = ErrorResponse {
@@ -212,7 +229,14 @@ async fn main() -> anyhow::Result<()> {
     )?));
     tracing::info!("Model '{}' loaded successfully", model_name);
 
-    let state = Arc::new(AppState { model });
+    let max_concurrent: usize = std::env::var("MAX_CONCURRENT_REQUESTS")
+        .unwrap_or_else(|_| "4".into())
+        .parse()
+        .unwrap_or(4);
+    tracing::info!("Max concurrent rerank requests: {}", max_concurrent);
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+
+    let state = Arc::new(AppState { model, semaphore });
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))

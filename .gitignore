@@ -2,3 +2,5 @@
 /models/*
 !models/.gitkeep
 export_model.py
+load_test.py
+play.py
