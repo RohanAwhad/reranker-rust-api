@@ -112,7 +112,7 @@ impl RerankerModel {
         let mut results: Vec<(usize, f32)> = data
             .iter()
             .enumerate()
-            .map(|(i, &logit)| (i, sigmoid(logit)))
+            .map(|(i, &logit)| (i, logit))
             .collect();
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -130,8 +130,4 @@ impl RerankerModel {
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
         Ok(encoding.len() as u32)
     }
-}
-
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
 }
