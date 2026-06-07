@@ -1,126 +1,99 @@
 # implementation-plan.md
 
-## Phase 1: Scaffold + Model Loading
+## Phase 0: ONNX Model Export + Inspection **[COMPLETED]**
+
+**Resolves:** GAP-01 through GAP-05, GAP-18
+
+- Export `gte-reranker-modernbert-base` to ONNX via `export_model.py`
+- Inspect exported model to confirm:
+  - Output shape: `[B, 1]` (confirmed — single logit per pair)
+  - Input names: `input_ids`, `attention_mask`, `token_type_ids` (confirmed)
+  - `num_labels=1` — single output logit, not binary classification
+  - ModernBERT tokenizer produces no `token_type_ids` but ONNX graph expects the input (pass all zeros)
+- Model file size: ~599 MB (FP32)
+
+## Phase 1: Scaffold + Model Loading **[COMPLETED]**
 
 **Features delivered:** CI, pre-commit, model loading
 
-- Copy `Cargo.toml` from embedding API (rename crate to `reranker_api`, same deps)
+- Copy `Cargo.toml` from embedding API (renamed to `reranker_api`, same deps + `env-filter` for RUST_LOG)
 - Copy CI workflow, pre-commit hook, `.gitignore`
-- Implement `src/reranker.rs`:
-  - `RerankerModel` struct: `session: Session`, `tokenizer: Tokenizer`, `name: String`
-  - `RerankerModel::load(model_dir: &Path, name: &str) -> Result<Self>`
-    - Load `model.onnx` via `Session::builder()` → `GraphOptimizationLevel::Level3` → `commit_from_file()`
-    - Load `tokenizer.json` via `Tokenizer::from_file()`
-    - Disable automatic padding/truncation (batching handled manually)
-- Implement `src/main.rs` skeleton:
-  - `AppState { model: Arc<Mutex<RerankerModel>> }`
-  - Load model from env vars at startup
-  - Placeholder routes (return 501)
-  - `#[tokio::main]` + `tracing_subscriber::fmt::init()`
-- Verify: `cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`
+- `src/reranker.rs`: `RerankerModel::load()` — ONNX session + tokenizer, graph opt level 3
+- `src/main.rs` skeleton: `AppState`, healthcheck, list_models, env var config
+- Verified: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo check` clean
 
-**Test strategy:** No unit tests in this phase — model file absent, no inference contract yet. CI must pass (fmt + clippy + check).
+## Phase 2: Inference Core **[COMPLETED]**
 
----
+**Features delivered:** Sigmoid scoring, multi-doc batching, sorting, truncation, token counting
 
-## Phase 2: Inference Core
+- `RerankerModel::rerank(&mut self, query, documents) -> Vec<(usize, f32)>`:
+  1. Build `EncodeInput::Dual(query, doc)` for each document (matching Python `tokenizer(q, d)`)
+  2. Tokenize batch via `encode_batch()`
+  3. Build padded `Array2<i64>` arrays (`input_ids`, `attention_mask`, `token_type_ids` — all zeros for type ids)
+  4. Run ONNX inference via `session.run()`
+  5. Extract `[B, 1]` logits, apply `sigmoid()`
+  6. Stable sort by score descending
+- `RerankerModel::count_tokens()` — pre-padding token count per pair
+- MAX_DOCUMENTS=500 (returns error if exceeded)
+- MAX_SEQ_LEN=8192 (truncates with `tracing::warn!`)
 
-**Features delivered:** Sigmoid scoring, multi-doc batching, sorting, truncation
+## Phase 3: HTTP Layer **[COMPLETED]**
 
-- Implement `RerankerModel::rerank(&mut self, query: &str, documents: &[String]) -> Result<Vec<(usize, f32)>>`:
-  1. Build pair texts: for each doc, format `query [SEP] doc` (tokenizer handles CLS/SEP)
-  2. Tokenize batch via `encode_batch()` — tokenizer auto-inserts `[CLS]` and `[SEP]` when given two texts
-  3. Build padded `Array2<i64>` for `input_ids`, `attention_mask`, `token_type_ids`
-  4. Run `session.run(ort::inputs![...])?`
-  5. Extract `[B, 1]` logit tensor, apply `sigmoid()` per entry
-  6. Sort `(index, score)` pairs by score descending (stable sort for tie-breaking)
-- Implement `sigmoid(x: f32) -> f32` helper
-- Truncation: if any pair exceeds model max tokens, truncate doc to fit and `tracing::warn!`
-- Edge cases: empty documents → empty vec; single document → single result
-- Verify: `cargo build` + no regressions from Phase 1
+**Features delivered:** Full API surface
 
-**Test strategy:** No unit tests — requires ONNX model file to run inference. Manual smoke test via `curl` after Phase 3. Start writing `devlogs.md` entries after this phase.
+- Routes: `POST /v1/rerank`, `GET /healthcheck`, `GET /v1/models`, `GET /docs` (Swagger)
+- Request/response types with `utoipa::ToSchema` derive
+- Model name validation (exact match) → 400 on mismatch
+- Inference errors → 500 with `server_error`
+- OpenAPI generation via `ApiDoc` struct + Swagger UI at `/docs`
+- `RUST_LOG` env var for tracing log level (via `tracing-subscriber` with `env-filter`)
 
----
+## Phase 4: Export Script **[COMPLETED]**
 
-## Phase 3: HTTP Layer
+- `export_model.py`: downloads model, exports to ONNX (opset 14), saves tokenizer
+- Includes shape inspection, input/output name verification
 
-**Features delivered:** Full API surface (`/v1/rerank`, `/healthcheck`, `/v1/models`, `/docs`)
+## Phase 5: Polish **[COMPLETED]**
 
-- Implement request/response types:
-  - `RerankRequest { model: String, query: String, documents: Vec<String> }`
-  - `RerankResponse { object: String, model: String, results: Vec<ResultItem>, usage: Usage }`
-  - `ResultItem { index: u32, relevance_score: f32 }`
-  - `Usage { total_tokens: u32 }`
-  - `HealthResponse`, `ModelsResponse`, `ErrorResponse` (same pattern as embedding API)
-- Implement route handlers:
-  - `POST /v1/rerank`: validate model name, extract texts, call `model.rerank()`, wrap response
-    - 200: success
-    - 400: wrong model name → `invalid_request_error`
-    - 500: inference failure → `server_error`
-  - `GET /healthcheck`: lock model, return `{ status, model }`
-  - `GET /v1/models`: return single-element model list
-- OpenAPI/Swagger:
-  - `ApiDoc` struct with `#[openapi(paths(...), components(schemas(...)))]`
-  - `#[utoipa::path(...)]` on each handler
-  - Swagger UI at `/docs`
-- Verify: `cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`
-
-**Test strategy:** Manual smoke tests via `curl` against running server:
-- `POST /v1/rerank` with valid request → 200, sorted results
-- `POST /v1/rerank` with wrong model → 400
-- `GET /healthcheck` → 200
-- `GET /v1/models` → 200
-- `GET /docs` → Swagger UI loads
-- Empty documents → 200, empty results
-- Single document → 200, single result
+- README with quickstart, API docs, config, benchmarks, model details
+- devlogs.md with implementation notes, resolved GAPs, benchmarks
+- Benchmark: Apple M4 — 10 docs ~51ms, 50 docs ~115ms
 
 ---
 
-## Phase 4: Export Script
+## Resolved PRD Gaps
 
-**Features delivered:** Reproducible ONNX model export
-
-- Create `export_model.py`:
-  - Downloads `Alibaba-NLP/gte-reranker-modernbert-base` via transformers
-  - Exports to `models/gte-reranker-modernbert-base/model.onnx` + tokenizer files
-  - Uses `AutoModelForSequenceClassification`, opset 14, dynamic axes
-- Verify: run `python3 export_model.py` → produces `model.onnx` + `tokenizer.json` + `tokenizer_config.json`
-
-**Test strategy:** End-to-end: run export, start server, send real `curl` requests, verify scores make sense (known pair: "Paris is the capital of France" should score higher than "France is a country" for query "capital of France").
-
----
-
-## Phase 5: Polish
-
-**Features delivered:** README, benchmarks, devlog completion
-
-- Write `README.md`: quickstart, endpoints, config, model details, build/test commands
-- Benchmark: score 50 documents, measure latency (p50/p95), report tokens/sec
-- Update `devlogs.md`: summary of all phases, known issues, future work
-- Remove `return_documents: bool` reference from Phase 5 (deferred to v2)
-- Verify: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`
-
-**Test strategy:** Benchmark numbers included in README/benchmark report. All CI checks green.
+| GAP | Resolution | Where |
+|-----|-----------|-------|
+| GAP-01/18 | Use `EncodeInput::Dual` in Rust (matching Python pair encoding) | `reranker.rs:61` |
+| GAP-02 | `token_type_ids` absent from tokenizer; ONNX expects it → pass zeros | `reranker.rs:80-85` |
+| GAP-03 | Output `[B, 1]` confirmed via ONNX inspection → iterate `data[i]` | `reranker.rs:107-110` |
+| GAP-04 | Dynamic axes correct per ONNX export | `export_model.py:65-70` |
+| GAP-05 | Input names match: `input_ids`, `attention_mask`, `token_type_ids` | `reranker.rs:88-96` |
+| GAP-10 | `MAX_DOCUMENTS=500` with error on exceed | `reranker.rs:11,48-52` |
+| GAP-17 | `RUST_LOG` env var via `tracing-subscriber` with `env-filter` feature | `main.rs:200-204` |
+| GAP-24 | Export moved to Phase 0 — model inspected before inference code written | This doc |
 
 ---
 
-## Feature-Phase Mapping
+## Feature-Phase Matrix
 
-| Feature | Phase 1 | Phase 2 | Phase 3 | Phase 4 | Phase 5 |
-|---------|:-------:|:-------:|:-------:|:-------:|:-------:|
-| CI + pre-commit | x | | | | |
-| Model loading (ONNX + tokenizer) | x | | | | |
-| Sigmoid scoring | | x | | | |
-| Multi-document batching | | x | | | |
-| Sort by score descending | | x | | | |
-| `>8192` token truncation | | x | | | |
-| `POST /v1/rerank` | | | x | | |
-| `GET /healthcheck` | | | x | | |
-| `GET /v1/models` | | | x | | |
-| `GET /docs` (Swagger) | | | x | | |
-| OpenAPI utoipa schemas | | | x | | |
-| Token usage response | | | x | | |
-| Error responses (400, 500) | | | x | | |
-| `export_model.py` | | | | x | |
-| README + benchmarks | | | | | x |
+| Feature | Phase 0 | Phase 1 | Phase 2 | Phase 3 | Phase 4 | Phase 5 |
+|---------|:-------:|:-------:|:-------:|:-------:|:-------:|:-------:|
+| ONNX export + inspection | x | | | | | |
+| CI + pre-commit | | x | | | | |
+| Model loading (ONNX + tokenizer) | | x | | | | |
+| Sigmoid scoring | | | x | | | |
+| Multi-document batching | | | x | | | |
+| Sort by score descending | | | x | | | |
+| `>8192` token truncation | | | x | | | |
+| Token counting (pre-padding) | | | x | | | |
+| MAX_DOCUMENTS limit | | | x | | | |
+| `POST /v1/rerank` | | | | x | | |
+| `GET /healthcheck` | | | | x | | |
+| `GET /v1/models` | | | | x | | |
+| `GET /docs` (Swagger) | | | | x | | |
+| OpenAPI utoipa schemas | | | | x | | |
+| Error responses (400, 500) | | | | x | | |
+| RUST_LOG log level | | | | x | | |
+| README + benchmarks | | | | | | x |

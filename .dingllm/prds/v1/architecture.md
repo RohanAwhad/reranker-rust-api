@@ -132,7 +132,7 @@ utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
 
 ---
@@ -146,3 +146,15 @@ struct AppState {
 ```
 
 Single model, single session. Loaded at startup, shared across all handlers via `Arc`.
+
+Note: `ndarray` version must match `ort`'s internal ndarray dependency version. `ort = "=2.0.0-rc.12"` requires `ndarray = "0.17"`.
+
+### Resolved Design Decisions
+
+| Decision | Resolution |
+|----------|-----------|
+| Pair tokenization | `EncodeInput::Dual(query.into(), doc.into())` in Rust matches Python `tokenizer(query, doc)` |
+| `token_type_ids` | ModernBERT tokenizer produces none; ONNX graph still expects the tensor → pass all zeros |
+| Output shape | Confirmed `[B, 1]` via ONNX inspection → iterate `data[i]` directly (flat output) |
+| MAX_DOCUMENTS | 500 per request; exceeded → error returned before tokenization |
+| Log level | `RUST_LOG` env var via `tracing-subscriber` with `env-filter` feature |
