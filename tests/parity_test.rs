@@ -69,13 +69,14 @@ fn parity_onnx_vs_python_ort_same() {
         )
         .unwrap();
 
-    // Python ORT verified: ML doc → logit 1.516696, Python doc → logit 1.651557
-    let ml_logit = results.iter().find(|r| r.0 == 0).unwrap().1;
-    let py_logit = results.iter().find(|r| r.0 == 1).unwrap().1;
-    assert!((ml_logit - 1.516696).abs() < 0.001, "ML logit: {ml_logit}");
+    // Python ORT raw logits: ML doc → 1.516696, Python doc → 1.651557
+    // After sigmoid: ML doc → 0.820048, Python doc → 0.839089
+    let ml_score = results.iter().find(|r| r.0 == 0).unwrap().1;
+    let py_score = results.iter().find(|r| r.0 == 1).unwrap().1;
+    assert!((ml_score - 0.820048).abs() < 0.001, "ML score: {ml_score}");
     assert!(
-        (py_logit - 1.651557).abs() < 0.001,
-        "Python logit: {py_logit}"
+        (py_score - 0.839089).abs() < 0.001,
+        "Python score: {py_score}"
     );
 }
 

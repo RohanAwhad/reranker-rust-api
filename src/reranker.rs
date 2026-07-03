@@ -112,7 +112,7 @@ impl RerankerModel {
         let mut results: Vec<(usize, f32)> = data
             .iter()
             .enumerate()
-            .map(|(i, &logit)| (i, logit))
+            .map(|(i, &logit)| (i, 1.0 / (1.0 + (-logit).exp())))
             .collect();
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
